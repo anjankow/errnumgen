@@ -56,23 +56,50 @@ func New(dir string) (Generator, error) {
 
 func (g *Generator) ParseErrs() error {
 	for _, pkg := range g.pkgs {
-		fmt.Println("PACKAGE NAME: ", pkg.Name)
+		debugPrintln("PACKAGE NAME: ", pkg.Name)
 
 		for _, stxFile := range pkg.Syntax {
 			tokenFile := pkg.Fset.File(stxFile.FileStart)
 			filename := tokenFile.Name()
 
-			if stxFile.Decls == nil {
-				fmt.Println(filename, "  --> No decls")
+			// Filter functions that return an error
+			j := 0
+			for _, decl := range stxFile.Decls {
+				fnDecl, ok := decl.(*ast.FuncDecl)
+				if !ok ||
+					fnDecl.Type.Results == nil ||
+					len(fnDecl.Type.Results.List) == 0 {
+					continue
+				}
+
+				rets := fnDecl.Type.Results.List
+				for _, ret := range rets {
+					// All types should implement the stringer interface
+					tp, ok := ret.Type.(fmt.Stringer)
+					if !ok {
+						// Errors will always implement the Stringer interface
+						debugPrintf(filename, "return type is not a stringer: %s", ret.Type)
+						continue
+					}
+
+					if tp.String() == "error" {
+						// Found a function that returns an error,
+						// keep it in the declarations list
+						stxFile.Decls[j] = decl
+						j++
+					}
+				}
+			}
+			stxFile.Decls = stxFile.Decls[:j]
+			debugPrintf(filename, "num decls: %d", len(stxFile.Decls))
+
+			for _, d := range stxFile.Decls {
+				debugPrintf(filename, "%+v", d)
 			}
 
-			shouldKeep := ast.FilterFile(stxFile, func(decl string) bool {
-				fmt.Println(filename, " -- decl: ", decl)
-				return true
-			})
-
+			shouldKeep := len(stxFile.Decls) > 0
 			if !shouldKeep {
-				fmt.Println(filename, " REMOVE ")
+				fmt.Println(filename, "no errors ")
 				pkg.Fset.RemoveFile(tokenFile)
 			}
 		}
@@ -83,4 +110,14 @@ func (g *Generator) ParseErrs() error {
 
 func (g *Generator) Generate(output string) error {
 	return nil
+}
+
+func debugPrintf(filename string, s string, a ...any) {
+	fmt.Printf(fmt.Sprintf("%s: %s\n", filename, s), a...)
+}
+
+func debugPrintln(filename string, s string, a ...any) {
+	args := []any{filename, s}
+	args = append(args, a...)
+	fmt.Println(args...)
 }
