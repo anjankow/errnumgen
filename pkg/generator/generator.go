@@ -24,8 +24,8 @@ func New(dir string) (Generator, error) {
 		Dir:   dir,
 		Tests: false,
 		ParseFile: func(fset *token.FileSet, filename string, data []byte) (*ast.File, error) {
-			// Check if there are any return statements in the file
-			if !bytes.Contains(data, []byte("return")) {
+			// Check if there are any return or error statements in the file
+			if !bytes.Contains(data, []byte("return")) || !bytes.Contains(data, []byte("error")) {
 				return nil, nil
 			}
 
@@ -102,10 +102,11 @@ func (g *Generator) ParseErrs() error {
 	return nil
 }
 
-func (g *Generator) filterPackageDecls(pkg *packages.Package) {
+func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
+	stxIdx := 0
 	for _, stxFile := range pkg.Syntax {
 		filename := getFilename(pkg, stxFile)
-		debugPrintf, debugPrintln := debugPrint(filename)
+		debugPrintf, _ := debugPrint(filename)
 
 		// Filter functions that return an error
 		j := 0
@@ -140,11 +141,21 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) {
 
 		shouldKeep := len(stxFile.Decls) > 0
 		if !shouldKeep {
-			debugPrintln("no errors ")
+			// Remove from token fileset
 			tokenFile := pkg.Fset.File(stxFile.FileStart)
+			if tokenFile == nil {
+				return fmt.Errorf("%s: failed to get token file", filename)
+			}
 			pkg.Fset.RemoveFile(tokenFile)
+		} else {
+			// Add to the syntax files list
+			pkg.Syntax[stxIdx] = stxFile
+			stxIdx++
 		}
 	}
+	pkg.Syntax = pkg.Syntax[:stxIdx]
+
+	return nil
 }
 
 func (g *Generator) Generate(output string) error {
