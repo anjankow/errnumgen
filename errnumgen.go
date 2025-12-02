@@ -1,0 +1,65 @@
+package main
+
+import (
+	"flag"
+	"log"
+	"os"
+
+	"github.com/anjankow/errnumgen/pkg/generator"
+)
+
+var (
+	output = flag.String("output", "errnums.go", "output file name; default errnums.go")
+	dryRun = flag.Bool("dry-run", false, "dry run - print the changes to be made to stdout")
+)
+
+func main() {
+	log.SetFlags(0)
+	log.SetPrefix("errnumgen: ")
+	flag.Parse()
+
+	args := flag.Args()
+	dir := "."
+	if len(args) > 0 {
+		if !isDirectory(args[0]) {
+			log.Fatalf("%q is not a directory", args[0])
+		}
+		dir = args[0]
+	}
+
+	// User input parsed and validated, start the generation
+	if err := run(dir); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(dir string) error {
+	g, err := generator.New(dir)
+	if err != nil {
+		return err
+	}
+
+	if err := g.ParseErrs(); err != nil {
+		return err
+	}
+
+	if *dryRun {
+		// just print
+		return nil
+	}
+
+	if err := g.Generate(*output); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// isDirectory reports whether the named file is a directory.
+func isDirectory(name string) bool {
+	info, err := os.Stat(name)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return info.IsDir()
+}
