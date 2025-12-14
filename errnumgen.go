@@ -34,7 +34,10 @@ func main() {
 }
 
 func run(dir string) error {
-	g, err := generator.New(dir)
+	opts := generator.GetDefaultGenOptions()
+	opts.OutPackageName = "errnums"
+
+	g, err := generator.New(dir, opts)
 	if err != nil {
 		return err
 	}

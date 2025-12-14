@@ -16,6 +16,7 @@ import (
 // the output for format.Source.
 type Generator struct {
 	pkgs      []*packages.Package
+	opts      GenOptions
 	originals map[string] /*filename*/ []byte
 	edits     map[string] /*filename*/ Edit
 }
@@ -23,8 +24,18 @@ type Generator struct {
 type Edit struct {
 }
 
+type GenOptions struct {
+	OutPackageName string
+}
+
+func GetDefaultGenOptions() GenOptions {
+	return GenOptions{
+		OutPackageName: "errnumgen",
+	}
+}
+
 // New analyses the package at the given directory and returns a new generator for this package
-func New(dir string) (Generator, error) {
+func New(dir string, options GenOptions) (Generator, error) {
 	cfg := &packages.Config{
 		Mode:  packages.NeedSyntax | packages.NeedFiles | packages.NeedName,
 		Dir:   dir,
@@ -57,30 +68,28 @@ func New(dir string) (Generator, error) {
 
 	return Generator{
 		pkgs: pkgs,
+		opts: options,
 	}, nil
 }
 
 func (g *Generator) ParseErrs(continueOnError bool) error {
 	for _, pkg := range g.pkgs {
 
-		_, debugPrintln := debugPrint(pkg.PkgPath)
-
 		g.filterPackageDecls(pkg)
-		debugPrintln("filtered package decls")
+		debugPrint(pkg, nil, "filtered package decls")
 
 		// The remaining declarations are now only function declarations that return an error
-		for _, stxFile := range pkg.Syntax {
-			filename := getFilename(pkg, stxFile)
-			debugPrintf, _ := debugPrint(filename)
+		for stxFileIdx, stxFile := range pkg.Syntax {
+			filename := getFilename(pkg, stxFile.FileStart)
 
 			// The content of this file will most likely be changed,
 			// read it first
 			originalContent, err := os.ReadFile(filename)
 			if err != nil {
-				return fmt.Errorf("%s: failed to read: %w", filename, err)
+				return errors.New(makeErrorMsgf(pkg, stxFile, "failed to read: %w", err))
 			}
 
-			for _, d := range stxFile.Decls {
+			for stxFileDeclIdx, d := range stxFile.Decls {
 				funcDecl, ok := d.(*ast.FuncDecl)
 				if !ok {
 					// It's a bug!
@@ -105,7 +114,7 @@ func (g *Generator) ParseErrs(continueOnError bool) error {
 					}
 				}
 
-				for _, stmt := range funcDecl.Body.List {
+				for bodyIdx, stmt := range funcDecl.Body.List {
 					// Find only the return statements
 					returnStmt, ok := stmt.(*ast.ReturnStmt)
 					if !ok {
@@ -113,12 +122,11 @@ func (g *Generator) ParseErrs(continueOnError bool) error {
 					}
 
 					if len(returnStmt.Results) != funcDecl.Type.Results.NumFields() {
-						msg := fmt.Sprintf("%s: %s: return statement has no results: %s: %v/%v", filename, funcDecl.Name, len(returnStmt.Results), funcDecl.Type.Results.NumFields())
 						if continueOnError {
-							debugPrint(msg)
+							debugPrint(pkg, returnStmt, "%s: unexpected number of returned values: %v/%v", funcDecl.Name, len(returnStmt.Results), funcDecl.Type.Results.NumFields())
 							continue
 						} else {
-							return errors.New(msg)
+							return errors.New(makeErrorMsgf(pkg, returnStmt, "%s: unexpected number of returned values: %v/%v", funcDecl.Name, len(returnStmt.Results), funcDecl.Type.Results.NumFields()))
 						}
 					}
 
@@ -127,8 +135,28 @@ func (g *Generator) ParseErrs(continueOnError bool) error {
 					fposStart := pkg.Fset.Position(retParam.Pos())
 					fposEnd := pkg.Fset.Position(retParam.End())
 					errorContent := string(originalContent[fposStart.Offset:fposEnd.Offset])
-					linenum := pkg.Fset.File(retParam.Pos()).Line(retParam.Pos())
-					debugPrintf("%v --- ret %+v", linenum, errorContent)
+					debugPrint(pkg, retParam, "--- ret %+v", errorContent)
+
+					if errorContent == "nil" {
+						// Do nothing
+						continue
+					}
+
+					// Now wrap the error in the wrapper like:
+					// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
+					newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
+					debugPrint(pkg, retParam, "--- ret %+v", errorContent)
+					debugPrint(pkg, retParam, "--- replaced with %s", newErrorContent)
+					newRetParam, err := parser.ParseExpr(newErrorContent)
+					if err != nil {
+						// It's a bug!
+						return errors.New(makeErrorMsgf(pkg, retParam, "failed to parse modified statement: %+v\n%+v", err, newErrorContent))
+					}
+					// Override the definition
+					returnStmt.Results[retErrIdx] = newRetParam
+					funcDecl.Body.List[bodyIdx] = returnStmt
+					stxFile.Decls[stxFileDeclIdx] = funcDecl
+					pkg.Syntax[stxFileIdx] = stxFile
 				}
 			}
 
@@ -138,11 +166,41 @@ func (g *Generator) ParseErrs(continueOnError bool) error {
 	return nil
 }
 
+func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
+	msg := makeErrorMsgf(pkg, node, message, args...)
+	fmt.Print(msg)
+}
+
+func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ...any) string {
+	if pkg == nil {
+		return fmt.Sprintf(message, args...)
+	}
+
+	if node == nil {
+		// Include just the package name
+		msg := fmt.Sprintf("package %s: %s\n", pkg.Name, message)
+		return fmt.Sprintf(msg, args)
+	}
+
+	file := pkg.Fset.File(node.Pos())
+	if file == nil {
+		return fmt.Sprintf(message, args...)
+	}
+
+	ln := file.Line(node.Pos())
+	filename := getFilename(pkg, node.Pos())
+
+	msg := fmt.Sprintf("%s:%v - %s\n", filename, ln, message)
+	if len(args) > 0 {
+		return fmt.Sprintf(msg, args...)
+	}
+	return msg
+}
+
 func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 	stxIdx := 0
 	for _, stxFile := range pkg.Syntax {
-		filename := getFilename(pkg, stxFile)
-		debugPrintf, _ := debugPrint(filename)
+		filename := getFilename(pkg, stxFile.FileStart)
 
 		// Filter functions that return an error
 		j := 0
@@ -160,8 +218,7 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 				tp, ok := ret.Type.(fmt.Stringer)
 				if !ok {
 					// Errors will always implement the Stringer interface
-					linenum := pkg.Fset.File(ret.Pos()).Line(ret.Pos())
-					debugPrintf("%v: return type is not a stringer: %s", linenum, ret.Type)
+					// debugPrint("%v: return type is not a stringer: %s", getLineNum(pkg, ret), ret.Type)
 					continue
 				}
 
@@ -174,14 +231,14 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 			}
 		}
 		stxFile.Decls = stxFile.Decls[:j]
-		debugPrintf("num decls: %d", len(stxFile.Decls))
+		debugPrint(pkg, stxFile, "num decls: %d", len(stxFile.Decls))
 
 		shouldKeep := len(stxFile.Decls) > 0
 		if !shouldKeep {
 			// Remove from token fileset
 			tokenFile := pkg.Fset.File(stxFile.FileStart)
 			if tokenFile == nil {
-				return fmt.Errorf("%s: failed to get token file", filename)
+				return errors.New(makeErrorMsgf(pkg, stxFile, "%s: failed to get token file", filename))
 			}
 			pkg.Fset.RemoveFile(tokenFile)
 		} else {
@@ -199,20 +256,8 @@ func (g *Generator) Generate(output string) error {
 	return nil
 }
 
-func getFilename(pkg *packages.Package, stxFile *ast.File) string {
-	tokenFile := pkg.Fset.File(stxFile.FileStart)
+func getFilename(pkg *packages.Package, position token.Pos) string {
+	tokenFile := pkg.Fset.File(position)
 	filename := tokenFile.Name()
 	return filename
-}
-
-func debugPrint(filename string) (debugPrintf func(string, ...any), debugPrintln func(string, ...any)) {
-	printf := func(s string, a ...any) {
-		fmt.Printf(fmt.Sprintf("%s:%s\n", filename, s), a...)
-	}
-	println := func(s string, a ...any) {
-		args := []any{filename, s}
-		args = append(args, a...)
-		fmt.Println(args...)
-	}
-	return printf, println
 }
