@@ -72,14 +72,14 @@ func New(dir string, options GenOptions) (Generator, error) {
 	}, nil
 }
 
-func (g *Generator) ParseErrs(continueOnError bool) error {
+func (g *Generator) ParseErrs() error {
 	for _, pkg := range g.pkgs {
 
 		g.filterPackageDecls(pkg)
 		debugPrint(pkg, nil, "filtered package decls")
 
 		// The remaining declarations are now only function declarations that return an error
-		for stxFileIdx, stxFile := range pkg.Syntax {
+		for _, stxFile := range pkg.Syntax {
 			filename := getFilename(pkg, stxFile.FileStart)
 
 			// The content of this file will most likely be changed,
@@ -101,66 +101,86 @@ func (g *Generator) ParseErrs(continueOnError bool) error {
 					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
 				}
 
-				// Find which ret param is an error
-				retErrIdx := -1
-				for i, res := range funcDecl.Type.Results.List {
-					resStr, ok := res.Type.(fmt.Stringer)
-					if !ok {
-						continue
-					}
-					if resStr.String() == "error" {
-						retErrIdx = i
-						continue
-					}
+				err := g.parseAndUpdateFunction(pkg, funcDecl, originalContent)
+				if err != nil {
+					return fmt.Errorf("failed to update function: %w", err)
 				}
 
-				for bodyIdx, stmt := range funcDecl.Body.List {
-					// Find only the return statements
-					returnStmt, ok := stmt.(*ast.ReturnStmt)
-					if !ok {
-						continue
-					}
+				// Update with the new function content
+				stxFile.Decls[stxFileDeclIdx] = funcDecl
+			}
+		}
+	}
+	return nil
+}
+func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.FuncDecl, originalContent []byte) error {
+	// Find which ret param is an error
+	retErrIdx := -1
+	for i, res := range funcDecl.Type.Results.List {
+		resStr, ok := res.Type.(fmt.Stringer)
+		if !ok {
+			continue
+		}
+		if resStr.String() == "error" {
+			retErrIdx = i
+			continue
+		}
+	}
+	if retErrIdx == -1 {
+		// Error is not in the returned values
+		return nil
+	}
 
-					if len(returnStmt.Results) != funcDecl.Type.Results.NumFields() {
-						if continueOnError {
-							debugPrint(pkg, returnStmt, "%s: unexpected number of returned values: %v/%v", funcDecl.Name, len(returnStmt.Results), funcDecl.Type.Results.NumFields())
-							continue
-						} else {
-							return errors.New(makeErrorMsgf(pkg, returnStmt, "%s: unexpected number of returned values: %v/%v", funcDecl.Name, len(returnStmt.Results), funcDecl.Type.Results.NumFields()))
-						}
-					}
-
-					retParam := returnStmt.Results[retErrIdx]
-					// Read the retParam value
-					fposStart := pkg.Fset.Position(retParam.Pos())
-					fposEnd := pkg.Fset.Position(retParam.End())
-					errorContent := string(originalContent[fposStart.Offset:fposEnd.Offset])
-					debugPrint(pkg, retParam, "--- ret %+v", errorContent)
-
-					if errorContent == "nil" {
-						// Do nothing
-						continue
-					}
-
-					// Now wrap the error in the wrapper like:
-					// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
-					newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
-					debugPrint(pkg, retParam, "--- ret %+v", errorContent)
-					debugPrint(pkg, retParam, "--- replaced with %s", newErrorContent)
-					newRetParam, err := parser.ParseExpr(newErrorContent)
-					if err != nil {
-						// It's a bug!
-						return errors.New(makeErrorMsgf(pkg, retParam, "failed to parse modified statement: %+v\n%+v", err, newErrorContent))
-					}
-					// Override the definition
-					returnStmt.Results[retErrIdx] = newRetParam
-					funcDecl.Body.List[bodyIdx] = returnStmt
-					stxFile.Decls[stxFileDeclIdx] = funcDecl
-					pkg.Syntax[stxFileIdx] = stxFile
-				}
+	for bodyIdx, stmt := range funcDecl.Body.List {
+		inspectErrs := make([]error, 0)
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			// Find only the return statements
+			returnStmt, ok := n.(*ast.ReturnStmt)
+			if !ok {
+				return true
 			}
 
-		}
+			if len(returnStmt.Results) != funcDecl.Type.Results.NumFields() {
+				// There are 2 reasons for it:
+				// - just a return keyword is given with no params
+				// - the returned value is a function call
+				// We will ignore both of these cases.
+				debugPrint(pkg, returnStmt, "%s: unexpected number of returned values: %v/%v", funcDecl.Name, len(returnStmt.Results), funcDecl.Type.Results.NumFields())
+				return false
+			}
+
+			retParam := returnStmt.Results[retErrIdx]
+			retIdent, ok := retParam.(*ast.Ident)
+			if ok {
+				if retIdent.Name == "nil" {
+					// Ignore
+					return false
+				}
+				debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
+			}
+
+			// Read the retParam value
+			fposStart := pkg.Fset.Position(retParam.Pos())
+			fposEnd := pkg.Fset.Position(retParam.End())
+			errorContent := string(originalContent[fposStart.Offset:fposEnd.Offset])
+			debugPrint(pkg, retParam, "--- ret %+v", errorContent)
+
+			// Now wrap the error in the wrapper like:
+			// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
+			newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
+			debugPrint(pkg, retParam, "--- replaced with %s", newErrorContent)
+			newRetParam, err := parser.ParseExpr(newErrorContent)
+			if err != nil {
+				// It's a bug!
+				inspectErrs = append(inspectErrs, errors.New(makeErrorMsgf(pkg, retParam, "failed to parse modified statement: %+v\n%+v", err, newErrorContent)))
+				return false
+			}
+
+			// Override the definition
+			returnStmt.Results[retErrIdx] = newRetParam
+			funcDecl.Body.List[bodyIdx] = returnStmt
+			return false
+		})
 	}
 
 	return nil
