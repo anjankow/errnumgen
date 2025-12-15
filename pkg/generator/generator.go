@@ -159,6 +159,21 @@ func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.
 				debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
 			}
 
+			// If an error wrapper has already been generated, we want to keep it
+			retCallStmt, ok := retParam.(*ast.CallExpr)
+			if ok {
+				// Read the function name from the selector expr
+				selExpr, selOK := retCallStmt.Fun.(*ast.SelectorExpr)
+				if selOK && selExpr.Sel.Name == "New" {
+					// Identifier object holds the package name
+					ident, identOK := selExpr.X.(*ast.Ident)
+					if identOK && ident.Name == g.opts.OutPackageName {
+						// Skip - already generated
+						return false
+					}
+				}
+			}
+
 			// Read the retParam value
 			fposStart := pkg.Fset.Position(retParam.Pos())
 			fposEnd := pkg.Fset.Position(retParam.End())
