@@ -36,22 +36,18 @@ func main() {
 func run(dir string) error {
 	opts := generator.GetDefaultGenOptions()
 	opts.OutPackageName = "errnums"
+	opts.DryRun = true
 
 	g, err := generator.New(dir, opts)
 	if err != nil {
 		return err
 	}
 
-	if err := g.ParseErrs(); err != nil {
+	if err := g.UpdateErrs(); err != nil {
 		return err
 	}
 
-	if *dryRun {
-		// just print
-		return nil
-	}
-
-	if err := g.Generate(*output); err != nil {
+	if err := g.Generate(); err != nil {
 		return err
 	}
 

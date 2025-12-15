@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 
@@ -26,11 +27,13 @@ type Edit struct {
 
 type GenOptions struct {
 	OutPackageName string
+	DryRun         bool
 }
 
 func GetDefaultGenOptions() GenOptions {
 	return GenOptions{
 		OutPackageName: "errnumgen",
+		DryRun:         false,
 	}
 }
 
@@ -72,7 +75,7 @@ func New(dir string, options GenOptions) (Generator, error) {
 	}, nil
 }
 
-func (g *Generator) ParseErrs() error {
+func (g *Generator) UpdateErrs() error {
 	for _, pkg := range g.pkgs {
 
 		g.filterPackageDecls(pkg)
@@ -131,8 +134,8 @@ func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.
 		return nil
 	}
 
+	inspectErrs := make([]error, 0)
 	for bodyIdx, stmt := range funcDecl.Body.List {
-		inspectErrs := make([]error, 0)
 		ast.Inspect(stmt, func(n ast.Node) bool {
 			// Find only the return statements
 			returnStmt, ok := n.(*ast.ReturnStmt)
@@ -198,7 +201,7 @@ func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.
 		})
 	}
 
-	return nil
+	return errors.Join(inspectErrs...)
 }
 
 func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
@@ -214,7 +217,7 @@ func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ..
 	if node == nil {
 		// Include just the package name
 		msg := fmt.Sprintf("package %s: %s\n", pkg.Name, message)
-		return fmt.Sprintf(msg, args)
+		return fmt.Sprintf(msg, args...)
 	}
 
 	file := pkg.Fset.File(node.Pos())
@@ -287,8 +290,29 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 	return nil
 }
 
-func (g *Generator) Generate(output string) error {
-	return nil
+func (g *Generator) Generate() error {
+	cfg := &printer.Config{
+		Mode:     printer.TabIndent | printer.UseSpaces,
+		Tabwidth: 4,
+	}
+
+	// Only dryrun for now
+	var out bytes.Buffer
+	var errs []error
+	for _, pkg := range g.pkgs {
+		for _, stx := range pkg.Syntax {
+			filename := getFilename(pkg, stx.FileStart)
+			if err := cfg.Fprint(&out, pkg.Fset, stx); err != nil {
+				errs = append(errs, errors.New(makeErrorMsgf(pkg, nil, "%s: failed to write out buffer: %v", filename, err)))
+				continue
+			}
+
+			fmt.Println("---->>>", filename)
+			fmt.Println(out.String())
+			fmt.Println()
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func getFilename(pkg *packages.Package, position token.Pos) string {
