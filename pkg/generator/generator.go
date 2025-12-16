@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
-	"go/printer"
 	"go/token"
+	"log"
 	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -16,29 +20,40 @@ import (
 // Generator holds the state of the analysis. Primarily used to buffer
 // the output for format.Source.
 type Generator struct {
-	pkgs      []*packages.Package
-	opts      GenOptions
-	originals map[string] /*filename*/ []byte
-	edits     map[string] /*filename*/ Edit
+	pkgs []*packages.Package
+	opts GenOptions
+	// index in the first slice corresponds to the package index;
+	// index in the second slice corresponds to the statement order
+	edits    [][]Edit
+	contents map[string]string // map[filename]file_content
+
+	outPkg *packages.Package
 }
 
 type Edit struct {
+	From      ast.Node
+	To        ast.Node
+	ToContent string
 }
 
 type GenOptions struct {
 	OutPackageName string
-	DryRun         bool
+	// OutPath is the path of the output file containing error enumeration
+	OutPath string
+	DryRun  bool
 }
 
 func GetDefaultGenOptions() GenOptions {
 	return GenOptions{
-		OutPackageName: "errnumgen",
+		OutPackageName: "errnums",
+		OutPath:        "./errnums/errnums.go",
 		DryRun:         false,
 	}
 }
 
 // New analyses the package at the given directory and returns a new generator for this package
 func New(dir string, options GenOptions) (Generator, error) {
+	// To load all project files
 	cfg := &packages.Config{
 		Mode:  packages.NeedSyntax | packages.NeedFiles | packages.NeedName,
 		Dir:   dir,
@@ -69,14 +84,76 @@ func New(dir string, options GenOptions) (Generator, error) {
 		return Generator{}, fmt.Errorf("no packages found in %s", dir)
 	}
 
+	// Get the absolute paths of the input and output dirs
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil {
+		return Generator{}, fmt.Errorf("invalid input dir %s, can't create an absolute path: %w", dir, err)
+	}
+
+	outPathAbs, err := filepath.Abs(options.OutPath)
+	if err != nil {
+		return Generator{}, fmt.Errorf("invalid output path %s, can't create an absolute path: %w", options.OutPath, err)
+	}
+	if outPathAbs == "." {
+		return Generator{}, fmt.Errorf("invalid output file path %s", options.OutPath)
+	}
+	outDirAbs := path.Dir(outPathAbs)
+
+	var outPkg *packages.Package
+	// Now, if the output file will be generated outside of the input directory,
+	// load the output package too (if exists)
+	if strings.Contains(outDirAbs, dirAbs) {
+		cfg := &packages.Config{
+			Mode:  packages.NeedSyntax | packages.NeedFiles | packages.NeedName,
+			Dir:   outDirAbs,
+			Tests: false,
+			ParseFile: func(fset *token.FileSet, filename string, data []byte) (*ast.File, error) {
+				if filename != path.Base(outPathAbs) {
+					return nil, nil
+				}
+				const mode = parser.AllErrors | parser.SkipObjectResolution
+				return parser.ParseFile(fset, filename, data, mode)
+			},
+		}
+
+		// Load just the package from the out directory
+		const patterns = "."
+		pkgs, err := packages.Load(cfg, patterns)
+		if err != nil {
+			return Generator{}, fmt.Errorf("failed to load the package from out directory: %w", err)
+		}
+
+		if len(pkgs) == 1 {
+			outPkg = pkgs[0]
+		} else if len(pkgs) != 0 {
+			return Generator{}, fmt.Errorf("invalid number of found packages in out directory: %v, expected 1", len(pkgs))
+		}
+	} else {
+		// The out package is within the loaded packages, found it.
+		// It can be nil in case if the file hasn't been generated yet.
+		for _, pkg := range pkgs {
+			if slices.Contains(pkg.GoFiles, outPathAbs) {
+				outPkg = pkg
+				break
+			}
+		}
+	}
+
+	if outPkg == nil {
+		log.Println("Output file not found, a new one will be generated")
+	}
+
 	return Generator{
-		pkgs: pkgs,
-		opts: options,
+		pkgs:     pkgs,
+		opts:     options,
+		edits:    make([][]Edit, len(pkgs)),
+		contents: make(map[string]string),
+		outPkg:   outPkg,
 	}, nil
 }
 
-func (g *Generator) UpdateErrs() error {
-	for _, pkg := range g.pkgs {
+func (g *Generator) FindErrs() error {
+	for pkgIdx, pkg := range g.pkgs {
 
 		g.filterPackageDecls(pkg)
 		debugPrint(pkg, nil, "filtered package decls")
@@ -91,6 +168,7 @@ func (g *Generator) UpdateErrs() error {
 			if err != nil {
 				return errors.New(makeErrorMsgf(pkg, stxFile, "failed to read: %w", err))
 			}
+			g.contents[filename] = string(originalContent)
 
 			for stxFileDeclIdx, d := range stxFile.Decls {
 				funcDecl, ok := d.(*ast.FuncDecl)
@@ -104,7 +182,7 @@ func (g *Generator) UpdateErrs() error {
 					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
 				}
 
-				err := g.parseAndUpdateFunction(pkg, funcDecl, originalContent)
+				err := g.parseAndUpdateFunction(pkg, pkgIdx, funcDecl, originalContent)
 				if err != nil {
 					return fmt.Errorf("failed to update function: %w", err)
 				}
@@ -116,7 +194,7 @@ func (g *Generator) UpdateErrs() error {
 	}
 	return nil
 }
-func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.FuncDecl, originalContent []byte) error {
+func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, pkgIdx int, funcDecl *ast.FuncDecl, originalContent []byte) error {
 	// Find which ret param is an error
 	retErrIdx := -1
 	for i, res := range funcDecl.Type.Results.List {
@@ -135,7 +213,7 @@ func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.
 	}
 
 	inspectErrs := make([]error, 0)
-	for bodyIdx, stmt := range funcDecl.Body.List {
+	for _, stmt := range funcDecl.Body.List {
 		ast.Inspect(stmt, func(n ast.Node) bool {
 			// Find only the return statements
 			returnStmt, ok := n.(*ast.ReturnStmt)
@@ -177,26 +255,20 @@ func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.
 				}
 			}
 
-			// Read the retParam value
-			fposStart := pkg.Fset.Position(retParam.Pos())
-			fposEnd := pkg.Fset.Position(retParam.End())
-			errorContent := string(originalContent[fposStart.Offset:fposEnd.Offset])
-			debugPrint(pkg, retParam, "--- ret %+v", errorContent)
-
-			// Now wrap the error in the wrapper like:
-			// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
-			newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
-			debugPrint(pkg, retParam, "--- replaced with %s", newErrorContent)
-			newRetParam, err := parser.ParseExpr(newErrorContent)
+			newRetParam, newErrorContent, err := g.editReturnParam(pkgIdx, retParam, originalContent)
 			if err != nil {
-				// It's a bug!
-				inspectErrs = append(inspectErrs, errors.New(makeErrorMsgf(pkg, retParam, "failed to parse modified statement: %+v\n%+v", err, newErrorContent)))
+				inspectErrs = append(inspectErrs, err)
 				return false
 			}
 
-			// Override the definition
-			returnStmt.Results[retErrIdx] = newRetParam
-			funcDecl.Body.List[bodyIdx] = returnStmt
+			// Track the change
+			// Add to the edits
+			g.edits[pkgIdx] = append(g.edits[pkgIdx], Edit{
+				From:      retParam,
+				To:        newRetParam,
+				ToContent: newErrorContent,
+			})
+
 			return false
 		})
 	}
@@ -204,9 +276,30 @@ func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, funcDecl *ast.
 	return errors.Join(inspectErrs...)
 }
 
+func (g *Generator) editReturnParam(pkgIdx int, retParam ast.Node, originalContent []byte) (ast.Node, string, error) {
+	pkg := g.pkgs[pkgIdx]
+	// Read the retParam value
+	fposStart := pkg.Fset.Position(retParam.Pos())
+	fposEnd := pkg.Fset.Position(retParam.End())
+	errorContent := string(originalContent[fposStart.Offset:fposEnd.Offset])
+	debugPrint(pkg, retParam, "--- ret %+v", errorContent)
+
+	// Now wrap the error in the wrapper like:
+	// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
+	newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
+	debugPrint(pkg, retParam, "--- replaced with %s", newErrorContent)
+	newRetParam, err := parser.ParseExpr(newErrorContent)
+	if err != nil {
+		// It's a bug!
+		return nil, "", errors.New(makeErrorMsgf(pkg, retParam, "failed to parse modified statement: %+v\n%+v", err, newErrorContent))
+	}
+
+	return newRetParam, newErrorContent, nil
+}
+
 func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
-	msg := makeErrorMsgf(pkg, node, message, args...)
-	fmt.Print(msg)
+	// msg := makeErrorMsgf(pkg, node, message, args...)
+	// fmt.Print(msg)
 }
 
 func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ...any) string {
@@ -252,11 +345,9 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 
 			rets := fnDecl.Type.Results.List
 			for _, ret := range rets {
-				// All types should implement the stringer interface
+				// Errors will always implement the Stringer interface
 				tp, ok := ret.Type.(fmt.Stringer)
 				if !ok {
-					// Errors will always implement the Stringer interface
-					// debugPrint("%v: return type is not a stringer: %s", getLineNum(pkg, ret), ret.Type)
 					continue
 				}
 
@@ -291,28 +382,38 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 }
 
 func (g *Generator) Generate() error {
-	cfg := &printer.Config{
-		Mode:     printer.TabIndent | printer.UseSpaces,
-		Tabwidth: 4,
-	}
-
-	// Only dryrun for now
-	var out bytes.Buffer
 	var errs []error
-	for _, pkg := range g.pkgs {
-		for _, stx := range pkg.Syntax {
-			filename := getFilename(pkg, stx.FileStart)
-			if err := cfg.Fprint(&out, pkg.Fset, stx); err != nil {
-				errs = append(errs, errors.New(makeErrorMsgf(pkg, nil, "%s: failed to write out buffer: %v", filename, err)))
+	for pkgIdx, pkg := range g.pkgs {
+		pkgEdits := g.edits[pkgIdx]
+		// Start from the end of the slice to update the file from the end
+		// maintaining the correct positions of the previous nodes
+		for i := len(pkgEdits) - 1; i >= 0; i-- {
+			fromNode := pkgEdits[i].From
+			toContent := pkgEdits[i].ToContent
+
+			filename := getFilename(pkg, fromNode.Pos())
+			original := g.contents[filename]
+			file := pkg.Fset.File(fromNode.Pos())
+			if file == nil {
+				errs = append(errs, fmt.Errorf("file not found within the original files: %s", filename))
 				continue
 			}
 
-			fmt.Println("---->>>", filename)
-			fmt.Println(out.String())
-			fmt.Println()
+			start := file.Position(fromNode.Pos())
+			stop := file.Position(fromNode.End())
+
+			newContent := original[0:start.Offset] +
+				toContent +
+				original[stop.Offset:]
+			g.contents[filename] = newContent
 		}
 	}
+
 	return errors.Join(errs...)
+}
+
+func (g *Generator) GetFileContents() map[string]string {
+	return g.contents
 }
 
 func getFilename(pkg *packages.Package, position token.Pos) string {

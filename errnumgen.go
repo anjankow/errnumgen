@@ -35,21 +35,27 @@ func main() {
 
 func run(dir string) error {
 	opts := generator.GetDefaultGenOptions()
-	opts.OutPackageName = "errnums"
-	opts.DryRun = true
 
 	g, err := generator.New(dir, opts)
 	if err != nil {
 		return err
 	}
 
-	if err := g.UpdateErrs(); err != nil {
+	if err := g.FindErrs(); err != nil {
 		return err
 	}
 
 	if err := g.Generate(); err != nil {
 		return err
 	}
+
+	// updated := g.GetFileContents()
+	// for file, content := range updated {
+	// 	fmt.Println(file)
+	// 	fmt.Println(content)
+	// 	fmt.Println()
+	// }
+	// fmt.Println("num of updated files: ", len(updated))
 
 	return nil
 }
