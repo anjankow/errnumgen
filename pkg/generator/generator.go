@@ -28,6 +28,8 @@ type Generator struct {
 	contents map[string]string // map[filename]file_content
 
 	outPkg *packages.Package
+
+	readFile ReadFileFunc
 }
 
 type Edit struct {
@@ -41,13 +43,17 @@ type GenOptions struct {
 	// OutPath is the path of the output file containing error enumeration
 	OutPath string
 	DryRun  bool
+	Reader  ReadFileFunc
 }
+
+type ReadFileFunc func(filename string) ([]byte, error)
 
 func GetDefaultGenOptions() GenOptions {
 	return GenOptions{
 		OutPackageName: "errnums",
 		OutPath:        "./errnums/errnums.go",
 		DryRun:         false,
+		Reader:         os.ReadFile,
 	}
 }
 
@@ -153,14 +159,14 @@ func New(dir string, options GenOptions) (Generator, error) {
 		edits:    make([][]Edit, len(pkgs)),
 		contents: make(map[string]string),
 		outPkg:   outPkg,
+		readFile: options.Reader,
 	}, nil
 }
 
-func (g *Generator) FindErrs() error {
+func (g *Generator) ParseErrs() error {
 	for pkgIdx, pkg := range g.pkgs {
 
 		g.filterPackageDecls(pkg)
-		debugPrint(pkg, nil, "filtered package decls")
 
 		// The remaining declarations are now only function declarations that return an error
 		for _, stxFile := range pkg.Syntax {
@@ -168,13 +174,13 @@ func (g *Generator) FindErrs() error {
 
 			// The content of this file will most likely be changed,
 			// read it first
-			originalContent, err := os.ReadFile(filename)
+			originalContent, err := g.readFile(filename)
 			if err != nil {
 				return errors.New(makeErrorMsgf(pkg, stxFile, "failed to read: %v", err))
 			}
 			g.contents[filename] = string(originalContent)
 
-			for stxFileDeclIdx, d := range stxFile.Decls {
+			for _, d := range stxFile.Decls {
 				funcDecl, ok := d.(*ast.FuncDecl)
 				if !ok {
 					// It's a bug!
@@ -186,19 +192,16 @@ func (g *Generator) FindErrs() error {
 					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
 				}
 
-				err := g.parseAndUpdateFunction(pkg, pkgIdx, funcDecl, originalContent)
+				err := g.parseFunction(pkg, pkgIdx, funcDecl, originalContent)
 				if err != nil {
 					return fmt.Errorf("failed to update function: %w", err)
 				}
-
-				// Update with the new function content
-				stxFile.Decls[stxFileDeclIdx] = funcDecl
 			}
 		}
 	}
 	return nil
 }
-func (g *Generator) parseAndUpdateFunction(pkg *packages.Package, pkgIdx int, funcDecl *ast.FuncDecl, originalContent []byte) error {
+func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *ast.FuncDecl, originalContent []byte) error {
 	// Find which ret param is an error
 	retErrIdx := -1
 	for i, res := range funcDecl.Type.Results.List {
