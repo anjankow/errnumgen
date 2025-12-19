@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/anjankow/errnumgen/pkg/generator"
 )
@@ -35,6 +36,7 @@ func main() {
 
 func run(dir string) error {
 	opts := generator.GetDefaultGenOptions()
+	opts.OutPath = filepath.Join(dir, opts.OutPackageName, "errnums.go")
 
 	g, err := generator.New(dir, opts)
 	if err != nil {

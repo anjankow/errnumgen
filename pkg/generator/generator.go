@@ -102,7 +102,7 @@ func New(dir string, options GenOptions) (Generator, error) {
 	var outPkg *packages.Package
 	// Now, if the output file will be generated outside of the input directory,
 	// load the output package too (if exists)
-	if strings.Contains(outDirAbs, dirAbs) {
+	if !strings.Contains(outDirAbs, dirAbs) {
 		cfg := &packages.Config{
 			Mode:  packages.NeedSyntax | packages.NeedFiles | packages.NeedName,
 			Dir:   outDirAbs,
@@ -121,6 +121,10 @@ func New(dir string, options GenOptions) (Generator, error) {
 		pkgs, err := packages.Load(cfg, patterns)
 		if err != nil {
 			return Generator{}, fmt.Errorf("failed to load the package from out directory: %w", err)
+		}
+
+		if cnt := packages.PrintErrors(pkgs); cnt > 0 {
+			return Generator{}, fmt.Errorf("failed to load %d out packages", cnt)
 		}
 
 		if len(pkgs) == 1 {
@@ -166,7 +170,7 @@ func (g *Generator) FindErrs() error {
 			// read it first
 			originalContent, err := os.ReadFile(filename)
 			if err != nil {
-				return errors.New(makeErrorMsgf(pkg, stxFile, "failed to read: %w", err))
+				return errors.New(makeErrorMsgf(pkg, stxFile, "failed to read: %v", err))
 			}
 			g.contents[filename] = string(originalContent)
 
