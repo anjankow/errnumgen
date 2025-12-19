@@ -204,14 +204,24 @@ func (g *Generator) ParseErrs() error {
 func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *ast.FuncDecl, originalContent []byte) error {
 	// Find which ret param is an error
 	retErrIdx := -1
-	for i, res := range funcDecl.Type.Results.List {
-		resStr, ok := res.Type.(fmt.Stringer)
-		if !ok {
-			continue
+	paramCnt := 0
+	// debugPrint(pkg, funcDecl, "%d %d %+v", funcDecl.Type.Results.NumFields(), len(funcDecl.Type.Results.List), funcDecl.Type.Results.List[0].Names)
+	for _, res := range funcDecl.Type.Results.List {
+		// The returned error is of the ast.Ident type
+		resType, ok := res.Type.(*ast.Ident)
+		if ok && resType.Name == "error" {
+			retErrIdx = paramCnt
+			break
 		}
-		if resStr.String() == "error" {
-			retErrIdx = i
-			continue
+
+		// If a function returns multiple times the same type and it's named,
+		// the funcDecl.Type.Results.List will track it as just one result with multiple underlying Names;
+		// e.g. `s1 string, s2 string, err error` will be represented as 2 List Results
+		// where the first one has two names: s1 and s2.
+		if len(res.Names) > 0 {
+			paramCnt += len(res.Names)
+		} else {
+			paramCnt++
 		}
 	}
 	if retErrIdx == -1 {
@@ -244,7 +254,7 @@ func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *a
 					// Ignore
 					return false
 				}
-				debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
+				// debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
 			}
 
 			// If an error wrapper has already been generated, we want to keep it
@@ -305,8 +315,8 @@ func (g *Generator) editReturnParam(pkgIdx int, retParam ast.Node, originalConte
 }
 
 func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
-	// msg := makeErrorMsgf(pkg, node, message, args...)
-	// fmt.Print(msg)
+	msg := makeErrorMsgf(pkg, node, message, args...)
+	fmt.Print(msg)
 }
 
 func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ...any) string {
@@ -367,7 +377,7 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 			}
 		}
 		stxFile.Decls = stxFile.Decls[:j]
-		debugPrint(pkg, stxFile, "num decls: %d", len(stxFile.Decls))
+		// debugPrint(pkg, stxFile, "num decls: %d", len(stxFile.Decls))
 
 		shouldKeep := len(stxFile.Decls) > 0
 		if !shouldKeep {
