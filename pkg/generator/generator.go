@@ -20,22 +20,16 @@ import (
 // Generator holds the state of the analysis. Primarily used to buffer
 // the output for format.Source.
 type Generator struct {
-	pkgs []*packages.Package
-	opts GenOptions
+	pkgs     []*packages.Package
+	opts     GenOptions
+	readFile ReadFileFunc
+
+	// errsToEdit holds all errors that have to be edited.
 	// index in the first slice corresponds to the package index;
 	// index in the second slice corresponds to the statement order
-	edits    [][]Edit
-	contents map[string]string // map[filename]file_content
+	errsToEdit [][]ast.Node
 
 	outPkg *packages.Package
-
-	readFile ReadFileFunc
-}
-
-type Edit struct {
-	From      ast.Node
-	To        ast.Node
-	ToContent string
 }
 
 type GenOptions struct {
@@ -154,12 +148,11 @@ func New(dir string, options GenOptions) (Generator, error) {
 	}
 
 	return Generator{
-		pkgs:     pkgs,
-		opts:     options,
-		edits:    make([][]Edit, len(pkgs)),
-		contents: make(map[string]string),
-		outPkg:   outPkg,
-		readFile: options.Reader,
+		pkgs:       pkgs,
+		opts:       options,
+		errsToEdit: make([][]ast.Node, len(pkgs)),
+		outPkg:     outPkg,
+		readFile:   options.Reader,
 	}, nil
 }
 
@@ -171,14 +164,6 @@ func (g *Generator) ParseErrs() error {
 		// The remaining declarations are now only function declarations that return an error
 		for _, stxFile := range pkg.Syntax {
 			filename := getFilename(pkg, stxFile.FileStart)
-
-			// The content of this file will most likely be changed,
-			// read it first
-			originalContent, err := g.readFile(filename)
-			if err != nil {
-				return errors.New(makeErrorMsgf(pkg, stxFile, "failed to read: %v", err))
-			}
-			g.contents[filename] = string(originalContent)
 
 			for _, d := range stxFile.Decls {
 				funcDecl, ok := d.(*ast.FuncDecl)
@@ -192,16 +177,16 @@ func (g *Generator) ParseErrs() error {
 					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
 				}
 
-				err := g.parseFunction(pkg, pkgIdx, funcDecl, originalContent)
+				err := g.parseFunction(pkg, pkgIdx, funcDecl)
 				if err != nil {
-					return fmt.Errorf("failed to update function: %w", err)
+					return fmt.Errorf("%s: failed to update function: %w", filename, err)
 				}
 			}
 		}
 	}
 	return nil
 }
-func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *ast.FuncDecl, originalContent []byte) error {
+func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *ast.FuncDecl) error {
 	// Find which ret param is an error
 	retErrIdx := -1
 	paramCnt := 0
@@ -272,46 +257,14 @@ func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *a
 				}
 			}
 
-			newRetParam, newErrorContent, err := g.editReturnParam(pkgIdx, retParam, originalContent)
-			if err != nil {
-				inspectErrs = append(inspectErrs, err)
-				return false
-			}
-
-			// Track the change
-			// Add to the edits
-			g.edits[pkgIdx] = append(g.edits[pkgIdx], Edit{
-				From:      retParam,
-				To:        newRetParam,
-				ToContent: newErrorContent,
-			})
+			// Add to the found errors
+			g.errsToEdit[pkgIdx] = append(g.errsToEdit[pkgIdx], retParam)
 
 			return false
 		})
 	}
 
 	return errors.Join(inspectErrs...)
-}
-
-func (g *Generator) editReturnParam(pkgIdx int, retParam ast.Node, originalContent []byte) (ast.Node, string, error) {
-	pkg := g.pkgs[pkgIdx]
-	// Read the retParam value
-	fposStart := pkg.Fset.Position(retParam.Pos())
-	fposEnd := pkg.Fset.Position(retParam.End())
-	errorContent := string(originalContent[fposStart.Offset:fposEnd.Offset])
-	debugPrint(pkg, retParam, "--- ret %+v", errorContent)
-
-	// Now wrap the error in the wrapper like:
-	// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
-	newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
-	debugPrint(pkg, retParam, "--- replaced with %s", newErrorContent)
-	newRetParam, err := parser.ParseExpr(newErrorContent)
-	if err != nil {
-		// It's a bug!
-		return nil, "", errors.New(makeErrorMsgf(pkg, retParam, "failed to parse modified statement: %+v\n%+v", err, newErrorContent))
-	}
-
-	return newRetParam, newErrorContent, nil
 }
 
 func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
@@ -398,39 +351,68 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 	return nil
 }
 
-func (g *Generator) Generate() error {
+func (g *Generator) Generate() (fileContents map[string]string, err error) {
+
+	//
+	fileContents = make(map[string]string, len(g.errsToEdit))
+
 	var errs []error
 	for pkgIdx, pkg := range g.pkgs {
-		pkgEdits := g.edits[pkgIdx]
+		errNodes := g.errsToEdit[pkgIdx]
+
 		// Start from the end of the slice to update the file from the end
 		// maintaining the correct positions of the previous nodes
-		for i := len(pkgEdits) - 1; i >= 0; i-- {
-			fromNode := pkgEdits[i].From
-			toContent := pkgEdits[i].ToContent
+		for i := len(errNodes) - 1; i >= 0; i-- {
+			errNode := errNodes[i]
+			filename := getFilename(pkg, errNode.Pos())
 
-			filename := getFilename(pkg, fromNode.Pos())
-			original := g.contents[filename]
-			file := pkg.Fset.File(fromNode.Pos())
+			// Get the file content
+			content, ok := fileContents[filename]
+			if !ok {
+				// Read it
+				originalContent, err := g.readFile(filename)
+				if err != nil {
+					errs = append(errs, errors.New(makeErrorMsgf(pkg, errNode, "failed to read: %v", err)))
+					continue
+				}
+				content = string(originalContent)
+			}
+
+			// Read the retParam value
+			fposStart := pkg.Fset.Position(errNode.Pos())
+			fposEnd := pkg.Fset.Position(errNode.End())
+			errorContent := content[fposStart.Offset:fposEnd.Offset]
+			debugPrint(pkg, errNode, "--- ret %+v", errorContent)
+
+			// Now wrap the error in the wrapper like:
+			// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
+			newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
+			debugPrint(pkg, errNode, "--- replaced with %s", newErrorContent)
+			_, err := parser.ParseExpr(newErrorContent)
+			if err != nil {
+				// It's a bug!
+				return nil, errors.New(makeErrorMsgf(pkg, errNode, "failed to parse modified statement: %+v\n%+v", err, newErrorContent))
+			}
+
+			file := pkg.Fset.File(errNode.Pos())
 			if file == nil {
 				errs = append(errs, fmt.Errorf("file not found within the original files: %s", filename))
 				continue
 			}
 
-			start := file.Position(fromNode.Pos())
-			stop := file.Position(fromNode.End())
+			start := file.Position(errNode.Pos())
+			stop := file.Position(errNode.End())
 
-			newContent := original[0:start.Offset] +
-				toContent +
-				original[stop.Offset:]
-			g.contents[filename] = newContent
+			newContent := content[0:start.Offset] +
+				newErrorContent +
+				content[stop.Offset:]
+
+				// Assign to the return map
+			fileContents[filename] = newContent
 		}
 	}
 
-	return errors.Join(errs...)
-}
-
-func (g *Generator) GetFileContents() map[string]string {
-	return g.contents
+	return fileContents, errors.Join(errs...)
 }
 
 func getFilename(pkg *packages.Package, position token.Pos) string {

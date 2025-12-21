@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -47,17 +48,17 @@ func run(dir string) error {
 		return err
 	}
 
-	if err := g.Generate(); err != nil {
+	updated, err := g.Generate()
+	if err != nil {
 		return err
 	}
 
-	// updated := g.GetFileContents()
-	// for file, content := range updated {
-	// 	fmt.Println(file)
-	// 	fmt.Println(content)
-	// 	fmt.Println()
-	// }
-	// fmt.Println("num of updated files: ", len(updated))
+	for file, content := range updated {
+		fmt.Println(file)
+		fmt.Println(content)
+		fmt.Println()
+	}
+	fmt.Println("num of updated files: ", len(updated))
 
 	return nil
 }
