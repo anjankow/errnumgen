@@ -177,7 +177,7 @@ func (g *Generator) ParseErrs() error {
 					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
 				}
 
-				err := g.parseFunction(pkg, pkgIdx, funcDecl, funcDecl.Type, funcDecl.Body)
+				err := g.parseFunction(pkg, pkgIdx, funcDecl.Type, funcDecl.Body)
 				if err != nil {
 					return fmt.Errorf("%s: failed to update function: %w", filename, err)
 				}
@@ -186,9 +186,9 @@ func (g *Generator) ParseErrs() error {
 	}
 	return nil
 }
-func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl ast.Node, funcType *ast.FuncType, funcBody *ast.BlockStmt) error {
+func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcType *ast.FuncType, funcBody *ast.BlockStmt) error {
 
-	retErrIdx := g.findResultParamIdx(pkg, funcType)
+	retErrIdx := g.findResultParamIdx(funcType)
 	if retErrIdx == -1 {
 		// Error is not in the returned values
 		return nil
@@ -199,7 +199,7 @@ func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl as
 			switch node := n.(type) {
 			case *ast.FuncLit:
 				// Parsing an annonymous function
-				if err := g.parseFunction(pkg, pkgIdx, node, node.Type, node.Body); err != nil {
+				if err := g.parseFunction(pkg, pkgIdx, node.Type, node.Body); err != nil {
 					inspectErrs = append(inspectErrs, err)
 					return false
 				}
@@ -217,7 +217,7 @@ func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl as
 }
 
 // findResultParamIdx returns -1 if error in not found among returned params
-func (g Generator) findResultParamIdx(pkg *packages.Package, funcType *ast.FuncType) int {
+func (g Generator) findResultParamIdx(funcType *ast.FuncType) int {
 	// Find which ret param is an error
 	retErrIdx := -1
 	paramCnt := 0
