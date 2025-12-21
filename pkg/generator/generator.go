@@ -35,7 +35,7 @@ type Generator struct {
 	outPkg     *packages.Package
 	outPathAbs string
 	// lastErrNum is the last err number, the next generated error should start from this one +1
-	lastErrNum uint64
+	lastErrNum int
 }
 
 type GenOptions struct {
@@ -245,7 +245,7 @@ func (g *Generator) parseErrEnumeration() error {
 	}
 
 	debugPrint(g.outPkg, outFile, "found last err num: %v", lastErrNum)
-	g.lastErrNum = lastErrNum
+	g.lastErrNum = int(lastErrNum)
 
 	return nil
 }
@@ -297,7 +297,7 @@ func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcType *a
 					inspectErrs = append(inspectErrs, err)
 					return false
 				}
-				return true
+				return false
 			case *ast.ReturnStmt:
 				g.parseResultParams(pkg, pkgIdx, node, retErrIdx, funcType.Results.NumFields())
 				return false
@@ -462,8 +462,9 @@ func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
 	return nil
 }
 
-func (g *Generator) Generate() (fileContents map[string]string, err error) {
+const constErrPrefix = "N"
 
+func (g *Generator) Generate() (fileContents map[string]string, err error) {
 	//
 	fileContents = make(map[string]string, len(g.errsToEdit))
 
@@ -495,9 +496,11 @@ func (g *Generator) Generate() (fileContents map[string]string, err error) {
 			errorContent := content[fposStart.Offset:fposEnd.Offset]
 			debugPrint(pkg, errNode, "--- ret %+v", errorContent)
 
+			errNum := g.lastErrNum + i + 1
 			// Now wrap the error in the wrapper like:
-			// errnums.New(ERR_NUM_PLACEHOLDER, errors.New("original error"))
-			newErrorContent := fmt.Sprintf("%s.New(ERR_NUM_PLACEHOLDER, %s)", g.opts.OutPackageName, errorContent)
+			// errnums.New(errnums.N_12, errors.New("original error"))
+			newErrorContent := fmt.Sprintf("%s.New(%s.%s_%v, %s)",
+				g.opts.OutPackageName, g.opts.OutPackageName, constErrPrefix, errNum, errorContent)
 			debugPrint(pkg, errNode, "--- replaced with %s", newErrorContent)
 			_, err := parser.ParseExpr(newErrorContent)
 			if err != nil {
@@ -521,6 +524,8 @@ func (g *Generator) Generate() (fileContents map[string]string, err error) {
 				// Assign to the return map
 			fileContents[filename] = newContent
 		}
+
+		g.lastErrNum += len(errNodes)
 	}
 
 	return fileContents, errors.Join(errs...)
