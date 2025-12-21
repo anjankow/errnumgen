@@ -177,7 +177,7 @@ func (g *Generator) ParseErrs() error {
 					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
 				}
 
-				err := g.parseFunction(pkg, pkgIdx, funcDecl)
+				err := g.parseFunction(pkg, pkgIdx, funcDecl, funcDecl.Type, funcDecl.Body)
 				if err != nil {
 					return fmt.Errorf("%s: failed to update function: %w", filename, err)
 				}
@@ -186,12 +186,43 @@ func (g *Generator) ParseErrs() error {
 	}
 	return nil
 }
-func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *ast.FuncDecl) error {
+func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl ast.Node, funcType *ast.FuncType, funcBody *ast.BlockStmt) error {
+
+	retErrIdx := g.findResultParamIdx(pkg, funcType)
+	if retErrIdx == -1 {
+		// Error is not in the returned values
+		return nil
+	}
+	inspectErrs := make([]error, 0)
+	for _, stmt := range funcBody.List {
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncLit:
+				// Parsing an annonymous function
+				if err := g.parseFunction(pkg, pkgIdx, node, node.Type, node.Body); err != nil {
+					inspectErrs = append(inspectErrs, err)
+					return false
+				}
+				return true
+			case *ast.ReturnStmt:
+				g.parseResultParams(pkg, pkgIdx, node, retErrIdx, funcType.Results.NumFields())
+				return false
+			default:
+				return true
+			}
+		})
+	}
+
+	return errors.Join(inspectErrs...)
+}
+
+// findResultParamIdx returns -1 if error in not found among returned params
+func (g Generator) findResultParamIdx(pkg *packages.Package, funcType *ast.FuncType) int {
 	// Find which ret param is an error
 	retErrIdx := -1
 	paramCnt := 0
-	// debugPrint(pkg, funcDecl, "%d %d %+v", funcDecl.Type.Results.NumFields(), len(funcDecl.Type.Results.List), funcDecl.Type.Results.List[0].Names)
-	for _, res := range funcDecl.Type.Results.List {
+	// debugPrint(pkg, funcType, "%d %d %+v", funcType.Results.NumFields(), len(funcType.Results.List), funcType.Results.List[0].Names)
+	for _, res := range funcType.Results.List {
 		// The returned error is of the ast.Ident type
 		resType, ok := res.Type.(*ast.Ident)
 		if ok && resType.Name == "error" {
@@ -209,62 +240,48 @@ func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcDecl *a
 			paramCnt++
 		}
 	}
-	if retErrIdx == -1 {
-		// Error is not in the returned values
+	return retErrIdx
+}
+
+func (g *Generator) parseResultParams(pkg *packages.Package, pkgIdx int, returnStmt *ast.ReturnStmt, retErrIdx int, retNumFields int) error {
+
+	if len(returnStmt.Results) != retNumFields {
+		// There are 2 reasons for it:
+		// - just a return keyword is given with no params
+		// - the returned value is a function call
+		// We will ignore both of these cases.
+		debugPrint(pkg, returnStmt, "unexpected number of returned values: %v/%v", len(returnStmt.Results), retNumFields)
 		return nil
 	}
 
-	inspectErrs := make([]error, 0)
-	for _, stmt := range funcDecl.Body.List {
-		ast.Inspect(stmt, func(n ast.Node) bool {
-			// Find only the return statements
-			returnStmt, ok := n.(*ast.ReturnStmt)
-			if !ok {
-				return true
-			}
-
-			if len(returnStmt.Results) != funcDecl.Type.Results.NumFields() {
-				// There are 2 reasons for it:
-				// - just a return keyword is given with no params
-				// - the returned value is a function call
-				// We will ignore both of these cases.
-				debugPrint(pkg, returnStmt, "%s: unexpected number of returned values: %v/%v", funcDecl.Name, len(returnStmt.Results), funcDecl.Type.Results.NumFields())
-				return false
-			}
-
-			retParam := returnStmt.Results[retErrIdx]
-			retIdent, ok := retParam.(*ast.Ident)
-			if ok {
-				if retIdent.Name == "nil" {
-					// Ignore
-					return false
-				}
-				// debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
-			}
-
-			// If an error wrapper has already been generated, we want to keep it
-			retCallStmt, ok := retParam.(*ast.CallExpr)
-			if ok {
-				// Read the function name from the selector expr
-				selExpr, selOK := retCallStmt.Fun.(*ast.SelectorExpr)
-				if selOK && selExpr.Sel.Name == "New" {
-					// Identifier object holds the package name
-					ident, identOK := selExpr.X.(*ast.Ident)
-					if identOK && ident.Name == g.opts.OutPackageName {
-						// Skip - already generated
-						return false
-					}
-				}
-			}
-
-			// Add to the found errors
-			g.errsToEdit[pkgIdx] = append(g.errsToEdit[pkgIdx], retParam)
-
-			return false
-		})
+	retParam := returnStmt.Results[retErrIdx]
+	retIdent, ok := retParam.(*ast.Ident)
+	if ok {
+		if retIdent.Name == "nil" {
+			// Ignore
+			return nil
+		}
+		// debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
 	}
 
-	return errors.Join(inspectErrs...)
+	// If an error wrapper has already been generated, we want to keep it
+	retCallStmt, ok := retParam.(*ast.CallExpr)
+	if ok {
+		// Read the function name from the selector expr
+		selExpr, selOK := retCallStmt.Fun.(*ast.SelectorExpr)
+		if selOK && selExpr.Sel.Name == "New" {
+			// Identifier object holds the package name
+			ident, identOK := selExpr.X.(*ast.Ident)
+			if identOK && ident.Name == g.opts.OutPackageName {
+				// Skip - already generated
+				return nil
+			}
+		}
+	}
+
+	// Add to the found errors
+	g.errsToEdit[pkgIdx] = append(g.errsToEdit[pkgIdx], retParam)
+	return nil
 }
 
 func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
