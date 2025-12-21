@@ -44,7 +44,7 @@ func run(dir string) error {
 		return err
 	}
 
-	if err := g.ParseErrs(); err != nil {
+	if err := g.Parse(); err != nil {
 		return err
 	}
 
