@@ -48,16 +48,17 @@ func run(dir string) error {
 		return err
 	}
 
-	updated, err := g.Generate()
+	updated, outputFilename, err := g.Generate()
 	if err != nil {
 		return err
 	}
 
-	for file, content := range updated {
-		fmt.Println(file)
-		fmt.Println(content)
-		fmt.Println()
-	}
+	fmt.Println(updated[outputFilename])
+	// for file, content := range updated {
+	// 	fmt.Println(file)
+	// 	fmt.Println(content)
+	// 	fmt.Println()
+	// }
 	fmt.Println("num of updated files: ", len(updated))
 
 	return nil
