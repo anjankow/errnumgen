@@ -233,7 +233,7 @@ func (g *Generator) genOutputFile() (string, error) {
 	consts.WriteString("const (\n")
 
 	for i := range g.lastErrNum {
-		line := fmt.Sprintf("\tN_%v ErrNum = %v\n", i+1, i+1)
+		line := fmt.Sprintf("\t%s%v ErrNum = %v\n", constErrPrefix, i+1, i+1)
 		consts.WriteString(line)
 	}
 	consts.WriteString(")")
