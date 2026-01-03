@@ -7,11 +7,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"log"
 	"os"
-	"path"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -19,8 +16,7 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// Generator holds the state of the analysis. Primarily used to buffer
-// the output for format.Source.
+// Generator is used to generate the output files
 type Generator struct {
 	pkgs     []*packages.Package
 	opts     GenOptions
@@ -31,9 +27,6 @@ type Generator struct {
 	// index in the second slice corresponds to the statement order
 	errsToEdit [][]ast.Node
 
-	// outPkg is populated when creating a New generator only if the output
-	// file with error enumeration exists
-	outPkg     *packages.Package
 	outPathAbs string
 	// lastErrNum is the last err number, the next generated error should start from this one +1
 	lastErrNum int
@@ -60,12 +53,7 @@ func GetDefaultGenOptions() GenOptions {
 
 // New analyses the package at the given directory and returns a new generator for this package
 func New(dir string, options GenOptions) (Generator, error) {
-	// Get the absolute paths of the input and output dirs
-	dirAbs, err := filepath.Abs(dir)
-	if err != nil {
-		return Generator{}, fmt.Errorf("invalid input dir %s, can't create an absolute path: %w", dir, err)
-	}
-
+	// Get the absolute paths
 	outPathAbs, err := filepath.Abs(options.OutPath)
 	if err != nil {
 		return Generator{}, fmt.Errorf("invalid output path %s, can't create an absolute path: %w", options.OutPath, err)
@@ -73,7 +61,6 @@ func New(dir string, options GenOptions) (Generator, error) {
 	if outPathAbs == "." {
 		return Generator{}, fmt.Errorf("invalid output file path %s", options.OutPath)
 	}
-	outDirAbs := path.Dir(outPathAbs)
 
 	// To load all project files
 	cfg := &packages.Config{
@@ -81,10 +68,9 @@ func New(dir string, options GenOptions) (Generator, error) {
 		Dir:   dir,
 		Tests: false,
 		ParseFile: func(fset *token.FileSet, filename string, data []byte) (*ast.File, error) {
-			// If it's not an output file,check if there are any return or error statements in the file.
+			// Check if there are any return or error statements in the file.
 			// If none found -> we can skip processing this file
-			if filename != outPathAbs &&
-				!(bytes.Contains(data, []byte("return")) || !bytes.Contains(data, []byte("error"))) {
+			if !bytes.Contains(data, []byte("return")) && !bytes.Contains(data, []byte("error")) {
 				return nil, nil
 			}
 
@@ -108,145 +94,20 @@ func New(dir string, options GenOptions) (Generator, error) {
 		return Generator{}, fmt.Errorf("no packages found in %s", dir)
 	}
 
-	var outPkg *packages.Package
-	// Now, if the output file will be generated outside of the input directory,
-	// load the output package too (if exists)
-	if !strings.Contains(outDirAbs, dirAbs) {
-		cfg := &packages.Config{
-			Mode:  packages.NeedSyntax | packages.NeedFiles | packages.NeedName,
-			Dir:   outDirAbs,
-			Tests: false,
-			ParseFile: func(fset *token.FileSet, filename string, data []byte) (*ast.File, error) {
-				if filename != path.Base(outPathAbs) {
-					return nil, nil
-				}
-				const mode = parser.AllErrors | parser.SkipObjectResolution
-				return parser.ParseFile(fset, filename, data, mode)
-			},
-		}
-
-		// Load just the package from the out directory
-		const patterns = "."
-		pkgs, err := packages.Load(cfg, patterns)
-		if err != nil {
-			return Generator{}, fmt.Errorf("failed to load the package from out directory: %w", err)
-		}
-
-		if cnt := packages.PrintErrors(pkgs); cnt > 0 {
-			return Generator{}, fmt.Errorf("failed to load %d out packages", cnt)
-		}
-
-		if len(pkgs) == 1 {
-			outPkg = pkgs[0]
-		} else if len(pkgs) != 0 {
-			return Generator{}, fmt.Errorf("invalid number of found packages in out directory: %v, expected 1", len(pkgs))
-		}
-	} else {
-		// The out package is within the loaded packages, found it.
-		// It can be nil in case if the file hasn't been generated yet.
-		for _, pkg := range pkgs {
-			if slices.Contains(pkg.GoFiles, outPathAbs) {
-				outPkg = pkg
-				break
-			}
-		}
-	}
-
-	if outPkg == nil {
-		log.Println("Output file not found, a new one will be generated")
-	}
-
 	return Generator{
 		pkgs:       pkgs,
 		opts:       options,
 		errsToEdit: make([][]ast.Node, len(pkgs)),
-		outPkg:     outPkg,
 		readFile:   options.Reader,
 		outPathAbs: outPathAbs,
 	}, nil
 }
 
 func (g *Generator) Parse() error {
-	// First parse the out package to init err enumeration
-	if err := g.parseErrEnumeration(); err != nil {
-		return err
-	}
-
 	// Now parse errors in the source files (including filtering out declarations with no errors)
 	if err := g.parseErrs(); err != nil {
 		return err
 	}
-
-	return nil
-}
-
-// parseErrEnumeration parses the existing output file containing the error enumerations (if exists).
-// The file is in the format:
-//
-// // package errnums
-// //
-// // type ErrNum int
-// //
-// // const (
-// // 	ErrNum_1 ErrNum = 1
-// // 	ErrNum_2 ErrNum = 2
-// // 	...
-// // )
-func (g *Generator) parseErrEnumeration() error {
-	// The output file doesn't exist - return nil, enumeration will start from the beginning
-	if g.outPkg == nil {
-		return nil
-	}
-
-	var outFile *ast.File
-	for _, stxFile := range g.outPkg.Syntax {
-		filename := getFilename(g.outPkg, stxFile.FileStart)
-		if filename == g.outPathAbs {
-			outFile = stxFile
-			break
-		}
-	}
-
-	if outFile == nil {
-		return fmt.Errorf("output file expected in %s but not found in the package %s:%s", g.outPathAbs, g.outPkg.Dir, g.outPkg.Name)
-	}
-
-	var lastErrNum uint64
-	for _, stmt := range outFile.Decls {
-		// Search the consts and found the one with a highest number
-		constDecl, ok := stmt.(*ast.GenDecl)
-		if !ok {
-			continue
-		}
-		if constDecl.Tok != token.CONST {
-			continue
-		}
-		// Now check the spec of this declaration
-		for _, s := range constDecl.Specs {
-			valSpec, ok := s.(*ast.ValueSpec)
-			if !ok {
-				return fmt.Errorf("invalid type %T of const decl in the output file, all const decls are expected to be of type ast.ValueSpec: %+v", s, s)
-			}
-			if len(valSpec.Values) != 1 {
-				return fmt.Errorf("invalid const value in the output file: %v, for the declaration: %v %v", len(valSpec.Values), valSpec.Names, valSpec.Values)
-			}
-			val := valSpec.Values[0]
-			valLit, ok := val.(*ast.BasicLit)
-			if !ok {
-				return fmt.Errorf("invalid const value in the output file for the declaration: %v, not an uint", valSpec.Names)
-			}
-			errNum, err := strconv.ParseUint(valLit.Value, 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid const value in the output file: %s: %w", valLit.Value, err)
-			}
-			if lastErrNum < errNum {
-				lastErrNum = errNum
-			}
-		}
-	}
-
-	debugPrint(g.outPkg, outFile, "found last err num: %v", lastErrNum)
-	g.lastErrNum = int(lastErrNum)
 
 	return nil
 }
@@ -371,7 +232,32 @@ func (g *Generator) parseResultParams(pkg *packages.Package, pkgIdx int, returnS
 			// Identifier object holds the package name
 			ident, identOK := selExpr.X.(*ast.Ident)
 			if identOK && ident.Name == g.opts.OutPackageName {
-				// Skip - already generated
+				// Already generated - check if the error number is not bigger than
+				// the latest found.
+				// Skip if anything is not as expected.
+				if len(retCallStmt.Args) != 2 {
+					return nil
+				}
+				numArg := retCallStmt.Args[0]
+				selExpr, selOK := numArg.(*ast.SelectorExpr)
+				if !selOK {
+					return nil
+				}
+				numName := selExpr.Sel.Name
+				numStr, ok := strings.CutPrefix(numName, "N_")
+				if !ok {
+					return nil
+				}
+				num, err := strconv.Atoi(numStr)
+				if err != nil {
+					return nil
+				}
+				// If the last found error is smaller than the current one,
+				// assign it to the latest found
+				if g.lastErrNum < num {
+					g.lastErrNum = num
+				}
+
 				return nil
 			}
 		}
