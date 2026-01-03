@@ -7,7 +7,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -17,7 +16,6 @@ import (
 // Parser analyzes the source files and finds the returned error AST nodes
 type Parser struct {
 	pkgs          []*packages.Package
-	readFile      ReadFileFunc
 	parseRetError RetParamParseFunc
 
 	// errsToEdit holds all errors that have to be edited.
@@ -27,8 +25,6 @@ type Parser struct {
 }
 
 type ParserOptions struct {
-	// Reader allows to add own read file implementation e.g. for testing.
-	Reader ReadFileFunc
 	// RetParamParser parses and possibly modified each node that represents a returned error
 	RetParamParser RetParamParseFunc
 	// SkipPaths lists all the paths that should not be analyzed.
@@ -36,13 +32,13 @@ type ParserOptions struct {
 	SkipPaths []string
 }
 
-type ReadFileFunc func(filename string) ([]byte, error)
-type RetParamParseFunc func(retParam ast.Expr) (out ast.Expr, skip bool)
+// RetParamParseFunc is called for each node that represents a returned error.
+// If skip is set to true, the node won't be included in the Parse result.
+type RetParamParseFunc func(pkg *packages.Package, retParam ast.Expr) (out ast.Expr, skip bool)
 
 func GetDefaultOptions() ParserOptions {
 	return ParserOptions{
-		Reader: os.ReadFile,
-		RetParamParser: func(retParam ast.Expr) (out ast.Expr, skip bool) {
+		RetParamParser: func(_ *packages.Package, retParam ast.Expr) (out ast.Expr, skip bool) {
 			return retParam, false
 		},
 	}
@@ -100,13 +96,15 @@ func New(dir string, options ParserOptions) (Parser, error) {
 
 	return Parser{
 		pkgs:          pkgs,
-		errsToEdit:    make([][]ast.Node, len(pkgs)),
-		readFile:      options.Reader,
 		parseRetError: options.RetParamParser,
 	}, nil
 }
 
-func (g *Parser) Parse() error {
+// Parse returns the error nodes that represent returned error params. They are
+// divided into the packages they belong to.
+func (g *Parser) Parse() (map[*packages.Package][]ast.Node, error) {
+	g.errsToEdit = make([][]ast.Node, len(g.pkgs))
+
 	for pkgIdx, pkg := range g.pkgs {
 
 		g.filterPackageDecls(pkg)
@@ -119,22 +117,30 @@ func (g *Parser) Parse() error {
 				funcDecl, ok := d.(*ast.FuncDecl)
 				if !ok {
 					// It's a bug!
-					return fmt.Errorf("%s: expected a function declaration, found: %T %+v", filename, d, d)
+					return nil, fmt.Errorf("%s: expected a function declaration, found: %T %+v", filename, d, d)
 				}
 
 				if funcDecl.Body == nil {
 					// Shouldn't happen
-					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
+					return nil, fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
 				}
 
 				err := g.parseFunction(pkg, pkgIdx, funcDecl.Type, funcDecl.Body)
 				if err != nil {
-					return fmt.Errorf("%s: failed to update function: %w", filename, err)
+					return nil, fmt.Errorf("%s: failed to update function: %w", filename, err)
 				}
 			}
 		}
 	}
-	return nil
+
+	// Convert the errsToEdit to the returned map
+	ret := make(map[*packages.Package][]ast.Node, len(g.pkgs))
+	for i, nodes := range g.errsToEdit {
+		pkg := g.pkgs[i]
+		ret[pkg] = nodes
+	}
+
+	return ret, nil
 }
 
 func (g *Parser) parseFunction(pkg *packages.Package, pkgIdx int, funcType *ast.FuncType, funcBody *ast.BlockStmt) error {
@@ -217,7 +223,7 @@ func (g *Parser) parseResultParams(pkg *packages.Package, pkgIdx int, returnStmt
 
 	// Let the user parse and edit the returned param node and notify if it should
 	// be added to the output nodes
-	retParam, skip := g.parseRetError(retParam)
+	retParam, skip := g.parseRetError(pkg, retParam)
 	if skip {
 		return nil
 	}
