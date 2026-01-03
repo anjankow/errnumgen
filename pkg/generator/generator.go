@@ -18,14 +18,8 @@ import (
 
 // Generator is used to generate the output files
 type Generator struct {
-	pkgs     []*packages.Package
 	opts     GenOptions
 	readFile ReadFileFunc
-
-	// errsToEdit holds all errors that have to be edited.
-	// index in the first slice corresponds to the package index;
-	// index in the second slice corresponds to the statement order
-	errsToEdit [][]ast.Node
 
 	outPathAbs string
 	// lastErrNum is the last err number, the next generated error should start from this one +1
@@ -51,221 +45,75 @@ func GetDefaultGenOptions() GenOptions {
 	}
 }
 
-// New analyses the package at the given directory and returns a new generator for this package
-func New(dir string, options GenOptions) (Generator, error) {
+func New(opts GenOptions) (Generator, error) {
 	// Get the absolute paths
-	outPathAbs, err := filepath.Abs(options.OutPath)
+	outPathAbs, err := filepath.Abs(opts.OutPath)
 	if err != nil {
-		return Generator{}, fmt.Errorf("invalid output path %s, can't create an absolute path: %w", options.OutPath, err)
+		return Generator{}, fmt.Errorf("invalid output path %s, can't create an absolute path: %w", opts.OutPath, err)
 	}
 	if outPathAbs == "." {
-		return Generator{}, fmt.Errorf("invalid output file path %s", options.OutPath)
-	}
-
-	// To load all project files
-	cfg := &packages.Config{
-		Mode:  packages.NeedSyntax | packages.NeedFiles | packages.NeedName,
-		Dir:   dir,
-		Tests: false,
-		ParseFile: func(fset *token.FileSet, filename string, data []byte) (*ast.File, error) {
-			// Check if there are any return or error statements in the file.
-			// If none found -> we can skip processing this file
-			if !bytes.Contains(data, []byte("return")) && !bytes.Contains(data, []byte("error")) {
-				return nil, nil
-			}
-
-			const mode = parser.AllErrors | parser.SkipObjectResolution
-			return parser.ParseFile(fset, filename, data, mode)
-		},
-	}
-
-	// Load all nested packages within the directory
-	const patterns = "./..."
-	pkgs, err := packages.Load(cfg, patterns)
-	if err != nil {
-		return Generator{}, err
-	}
-
-	if cnt := packages.PrintErrors(pkgs); cnt > 0 {
-		return Generator{}, fmt.Errorf("failed to load %d packages", cnt)
-	}
-
-	if len(pkgs) == 0 {
-		return Generator{}, fmt.Errorf("no packages found in %s", dir)
+		return Generator{}, fmt.Errorf("invalid output file path %s", opts.OutPath)
 	}
 
 	return Generator{
-		pkgs:       pkgs,
-		opts:       options,
-		errsToEdit: make([][]ast.Node, len(pkgs)),
-		readFile:   options.Reader,
+		opts:       opts,
+		readFile:   os.ReadFile,
 		outPathAbs: outPathAbs,
 	}, nil
 }
 
-func (g *Generator) Parse() error {
-	// Now parse errors in the source files (including filtering out declarations with no errors)
-	if err := g.parseErrs(); err != nil {
-		return err
-	}
+func (g *Generator) ParseRetParam(pkg *packages.Package, retParam ast.Expr) (out ast.Expr, skip bool) {
+	// We won't modify anything in the resulting node, set out param right away
+	out = retParam
 
-	return nil
-}
-
-func (g *Generator) parseErrs() error {
-	for pkgIdx, pkg := range g.pkgs {
-
-		g.filterPackageDecls(pkg)
-
-		// The remaining declarations are now only function declarations that return an error
-		for _, stxFile := range pkg.Syntax {
-			filename := getFilename(pkg, stxFile.FileStart)
-			if filename == g.outPathAbs {
-				continue
-			}
-
-			for _, d := range stxFile.Decls {
-				funcDecl, ok := d.(*ast.FuncDecl)
-				if !ok {
-					// It's a bug!
-					return fmt.Errorf("%s: expected a function declaration, found: %T %+v", filename, d, d)
-				}
-
-				if funcDecl.Body == nil {
-					// Shouldn't happen
-					return fmt.Errorf("%s: function declaration has no body: %s", filename, funcDecl.Name)
-				}
-
-				err := g.parseFunction(pkg, pkgIdx, funcDecl.Type, funcDecl.Body)
-				if err != nil {
-					return fmt.Errorf("%s: failed to update function: %w", filename, err)
-				}
-			}
-		}
-	}
-	return nil
-}
-func (g *Generator) parseFunction(pkg *packages.Package, pkgIdx int, funcType *ast.FuncType, funcBody *ast.BlockStmt) error {
-
-	retErrIdx := g.findResultParamIdx(funcType)
-	if retErrIdx == -1 {
-		// Error is not in the returned values
-		return nil
-	}
-	inspectErrs := make([]error, 0)
-	for _, stmt := range funcBody.List {
-		ast.Inspect(stmt, func(n ast.Node) bool {
-			switch node := n.(type) {
-			case *ast.FuncLit:
-				// Parsing an annonymous function
-				if err := g.parseFunction(pkg, pkgIdx, node.Type, node.Body); err != nil {
-					inspectErrs = append(inspectErrs, err)
-					return false
-				}
-				return false
-			case *ast.ReturnStmt:
-				g.parseResultParams(pkg, pkgIdx, node, retErrIdx, funcType.Results.NumFields())
-				return false
-			default:
-				return true
-			}
-		})
-	}
-
-	return errors.Join(inspectErrs...)
-}
-
-// findResultParamIdx returns -1 if error in not found among returned params
-func (g Generator) findResultParamIdx(funcType *ast.FuncType) int {
-	// Find which ret param is an error
-	retErrIdx := -1
-	paramCnt := 0
-	// debugPrint(pkg, funcType, "%d %d %+v", funcType.Results.NumFields(), len(funcType.Results.List), funcType.Results.List[0].Names)
-	for _, res := range funcType.Results.List {
-		// The returned error is of the ast.Ident type
-		resType, ok := res.Type.(*ast.Ident)
-		if ok && resType.Name == "error" {
-			retErrIdx = paramCnt
-			break
-		}
-
-		// If a function returns multiple times the same type and it's named,
-		// the funcDecl.Type.Results.List will track it as just one result with multiple underlying Names;
-		// e.g. `s1 string, s2 string, err error` will be represented as 2 List Results
-		// where the first one has two names: s1 and s2.
-		if len(res.Names) > 0 {
-			paramCnt += len(res.Names)
-		} else {
-			paramCnt++
-		}
-	}
-	return retErrIdx
-}
-
-func (g *Generator) parseResultParams(pkg *packages.Package, pkgIdx int, returnStmt *ast.ReturnStmt, retErrIdx int, retNumFields int) error {
-
-	if len(returnStmt.Results) != retNumFields {
-		// There are 2 reasons for it:
-		// - just a return keyword is given with no params
-		// - the returned value is a function call
-		// We will ignore both of these cases.
-		debugPrint(pkg, returnStmt, "unexpected number of returned values: %v/%v", len(returnStmt.Results), retNumFields)
-		return nil
-	}
-
-	retParam := returnStmt.Results[retErrIdx]
-	retIdent, ok := retParam.(*ast.Ident)
-	if ok {
-		if retIdent.Name == "nil" {
-			// Ignore
-			return nil
-		}
-		// debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
-	}
-
-	// If an error wrapper has already been generated, we want to keep it
+	// Check if the wrapper has already been generated.
+	// Set skip to false if anything is not as expected to generate the wrapper after parsing.
 	retCallStmt, ok := retParam.(*ast.CallExpr)
-	if ok {
-		// Read the function name from the selector expr
-		selExpr, selOK := retCallStmt.Fun.(*ast.SelectorExpr)
-		if selOK && selExpr.Sel.Name == "New" {
-			// Identifier object holds the package name
-			ident, identOK := selExpr.X.(*ast.Ident)
-			if identOK && ident.Name == g.opts.OutPackageName {
-				// Already generated - check if the error number is not bigger than
-				// the latest found.
-				// Skip if anything is not as expected.
-				if len(retCallStmt.Args) != 2 {
-					return nil
-				}
-				numArg := retCallStmt.Args[0]
-				selExpr, selOK := numArg.(*ast.SelectorExpr)
-				if !selOK {
-					return nil
-				}
-				numName := selExpr.Sel.Name
-				numStr, ok := strings.CutPrefix(numName, "N_")
-				if !ok {
-					return nil
-				}
-				num, err := strconv.Atoi(numStr)
-				if err != nil {
-					return nil
-				}
-				// If the last found error is smaller than the current one,
-				// assign it to the latest found
-				if g.lastErrNum < num {
-					g.lastErrNum = num
-				}
-
-				return nil
-			}
-		}
+	if !ok {
+		return
+	}
+	// Read the function name from the selector expr
+	selExpr, selOK := retCallStmt.Fun.(*ast.SelectorExpr)
+	if !selOK || selExpr.Sel.Name != "New" {
+		return
 	}
 
-	// Add to the found errors
-	g.errsToEdit[pkgIdx] = append(g.errsToEdit[pkgIdx], retParam)
-	return nil
+	// Identifier object holds the package name
+	ident, identOK := selExpr.X.(*ast.Ident)
+	if !identOK || !(ident.Name == g.opts.OutPackageName) {
+		return
+	}
+
+	// Already generated.
+	skip = true
+
+	// Check if the error number is not bigger than
+	// the latest found.
+	if len(retCallStmt.Args) != 2 {
+		return
+	}
+
+	numArg := retCallStmt.Args[0]
+	selExpr, selOK = numArg.(*ast.SelectorExpr)
+	if !selOK {
+		return
+	}
+	numName := selExpr.Sel.Name
+	numStr, ok := strings.CutPrefix(numName, constErrPrefix)
+	if !ok {
+		return
+	}
+	num, err := strconv.Atoi(numStr)
+	if err != nil {
+		return
+	}
+	// If the last found error is smaller than the current one,
+	// assign it to the latest found
+	if g.lastErrNum < num {
+		g.lastErrNum = num
+	}
+
+	return
 }
 
 func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
@@ -299,64 +147,11 @@ func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ..
 	return msg
 }
 
-func (g *Generator) filterPackageDecls(pkg *packages.Package) error {
-	stxIdx := 0
-	for _, stxFile := range pkg.Syntax {
-		filename := getFilename(pkg, stxFile.FileStart)
+const constErrPrefix = "N_"
 
-		// Filter functions that return an error
-		j := 0
-		for _, decl := range stxFile.Decls {
-			fnDecl, ok := decl.(*ast.FuncDecl)
-			if !ok ||
-				fnDecl.Type.Results == nil ||
-				len(fnDecl.Type.Results.List) == 0 {
-				continue
-			}
-
-			rets := fnDecl.Type.Results.List
-			for _, ret := range rets {
-				// Errors will always implement the Stringer interface
-				tp, ok := ret.Type.(fmt.Stringer)
-				if !ok {
-					continue
-				}
-
-				if tp.String() == "error" {
-					// Found a function that returns an error,
-					// keep it in the declarations list
-					stxFile.Decls[j] = decl
-					j++
-				}
-			}
-		}
-		stxFile.Decls = stxFile.Decls[:j]
-		// debugPrint(pkg, stxFile, "num decls: %d", len(stxFile.Decls))
-
-		shouldKeep := len(stxFile.Decls) > 0
-		if !shouldKeep {
-			// Remove from token fileset
-			tokenFile := pkg.Fset.File(stxFile.FileStart)
-			if tokenFile == nil {
-				return errors.New(makeErrorMsgf(pkg, stxFile, "%s: failed to get token file", filename))
-			}
-			pkg.Fset.RemoveFile(tokenFile)
-		} else {
-			// Add to the syntax files list
-			pkg.Syntax[stxIdx] = stxFile
-			stxIdx++
-		}
-	}
-	pkg.Syntax = pkg.Syntax[:stxIdx]
-
-	return nil
-}
-
-const constErrPrefix = "N"
-
-func (g *Generator) Generate() (fileContents map[string]string, outFilePath string, err error) {
+func (g *Generator) Generate(errNodes map[*packages.Package][]ast.Node) (fileContents map[string]string, outFilePath string, err error) {
 	// Init updated file contents with the out file
-	fileContents = make(map[string]string, len(g.pkgs))
+	fileContents = make(map[string]string, len(errNodes))
 
 	var errs []error
 	for pkgIdx, pkg := range g.pkgs {
@@ -389,7 +184,7 @@ func (g *Generator) Generate() (fileContents map[string]string, outFilePath stri
 			errNum := g.lastErrNum + i + 1
 			// Now wrap the error in the wrapper like:
 			// errnums.New(errnums.N_12, errors.New("original error"))
-			newErrorContent := fmt.Sprintf("%s.New(%s.%s_%v, %s)",
+			newErrorContent := fmt.Sprintf("%s.New(%s.%s%v, %s)",
 				g.opts.OutPackageName, g.opts.OutPackageName, constErrPrefix, errNum, errorContent)
 			debugPrint(pkg, errNode, "--- replaced with %s", newErrorContent)
 			_, err := parser.ParseExpr(newErrorContent)
