@@ -149,14 +149,12 @@ func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ..
 
 const constErrPrefix = "N_"
 
-func (g *Generator) Generate(errNodes map[*packages.Package][]ast.Node) (fileContents map[string]string, outFilePath string, err error) {
+func (g *Generator) Generate(errNodesMap map[*packages.Package][]ast.Node) (fileContents map[string]string, outFilePath string, err error) {
 	// Init updated file contents with the out file
-	fileContents = make(map[string]string, len(errNodes))
+	fileContents = make(map[string]string, len(errNodesMap))
 
 	var errs []error
-	for pkgIdx, pkg := range g.pkgs {
-		errNodes := g.errsToEdit[pkgIdx]
-
+	for pkg, errNodes := range errNodesMap {
 		// Start from the end of the slice to update the file from the end
 		// maintaining the correct positions of the previous nodes
 		for i := len(errNodes) - 1; i >= 0; i-- {

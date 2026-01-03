@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/anjankow/errnumgen/pkg/generator"
+	"github.com/anjankow/errnumgen/pkg/parser"
 )
 
 var (
@@ -36,19 +37,28 @@ func main() {
 }
 
 func run(dir string) error {
-	opts := generator.GetDefaultGenOptions()
-	opts.OutPath = filepath.Join(dir, opts.OutPackageName, "errnums.go")
+	gopts := generator.GetDefaultGenOptions()
+	gopts.OutPath = filepath.Join(dir, gopts.OutPackageName, "errnums.go")
 
-	g, err := generator.New(dir, opts)
+	g, err := generator.New(gopts)
 	if err != nil {
 		return err
 	}
 
-	if err := g.Parse(); err != nil {
+	popts := parser.GetDefaultOptions()
+	popts.RetParamParser = g.ParseRetParam
+	popts.SkipPaths = []string{gopts.OutPath}
+	p, err := parser.New(dir, popts)
+	if err != nil {
 		return err
 	}
 
-	updated, outputFilename, err := g.Generate()
+	parsed, err := p.Parse()
+	if err != nil {
+		return err
+	}
+
+	updated, outputFilename, err := g.Generate(parsed)
 	if err != nil {
 		return err
 	}
