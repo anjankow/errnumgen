@@ -68,7 +68,9 @@ func run(dir string) error {
 	popts.RetParamParser = g.ParseRetParam
 	popts.SkipPaths = []string{gopts.OutPath}
 	for p := range strings.SplitSeq(*skipPaths, ",") {
-		popts.SkipPaths = append(popts.SkipPaths, p)
+		if p != "" {
+			popts.SkipPaths = append(popts.SkipPaths, p)
+		}
 	}
 	// Initialize the parser
 	p, err := parser.New(dir, popts)
