@@ -123,11 +123,6 @@ func (g *Generator) ParseRetParam(pkg *packages.Package, retParam ast.Expr) (out
 	return
 }
 
-func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
-	msg := makeErrorMsgf(pkg, node, message, args...)
-	fmt.Print(msg)
-}
-
 func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ...any) string {
 	if pkg == nil {
 		return fmt.Sprintf(message, args...)
@@ -184,14 +179,12 @@ func (g *Generator) Generate(errNodesMap map[*packages.Package][]ast.Node) (file
 			fposStart := pkg.Fset.Position(errNode.Pos())
 			fposEnd := pkg.Fset.Position(errNode.End())
 			errorContent := content[fposStart.Offset:fposEnd.Offset]
-			debugPrint(pkg, errNode, "--- ret %+v", errorContent)
 
 			errNum := g.lastErrNum + i + 1
 			// Now wrap the error in the wrapper like:
 			// errnums.New(errnums.N_12, errors.New("original error"))
 			newErrorContent := fmt.Sprintf("%s.New(%s.%s%v, %s)",
 				g.opts.OutPackageName, g.opts.OutPackageName, constErrPrefix, errNum, errorContent)
-			debugPrint(pkg, errNode, "--- replaced with %s", newErrorContent)
 			_, err := parser.ParseExpr(newErrorContent)
 			if err != nil {
 				// It's a bug!

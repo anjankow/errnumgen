@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log"
 	"path/filepath"
 	"strings"
 
@@ -178,7 +179,6 @@ func (g Parser) findResultParamIdx(funcType *ast.FuncType) int {
 	// Find which ret param is an error
 	retErrIdx := -1
 	paramCnt := 0
-	// debugPrint(pkg, funcType, "%d %d %+v", funcType.Results.NumFields(), len(funcType.Results.List), funcType.Results.List[0].Names)
 	for _, res := range funcType.Results.List {
 		// The returned error is of the ast.Ident type
 		resType, ok := res.Type.(*ast.Ident)
@@ -207,7 +207,7 @@ func (g *Parser) parseResultParams(pkg *packages.Package, pkgIdx int, returnStmt
 		// - just a return keyword is given with no params
 		// - the returned value is a function call
 		// We will ignore both of these cases.
-		debugPrint(pkg, returnStmt, "unexpected number of returned values: %v/%v", len(returnStmt.Results), retNumFields)
+		log.Default().Println(makeErrorMsgf(pkg, returnStmt, "unexpected number of returned values: %v/%v", len(returnStmt.Results), retNumFields))
 		return nil
 	}
 
@@ -218,7 +218,6 @@ func (g *Parser) parseResultParams(pkg *packages.Package, pkgIdx int, returnStmt
 			// Ignore
 			return nil
 		}
-		// debugPrint(pkg, retParam, "--- ret ident %s ", retIdent.Name)
 	}
 
 	// Let the user parse and edit the returned param node and notify if it should
@@ -231,11 +230,6 @@ func (g *Parser) parseResultParams(pkg *packages.Package, pkgIdx int, returnStmt
 	// Add to the found errors
 	g.errsToEdit[pkgIdx] = append(g.errsToEdit[pkgIdx], retParam)
 	return nil
-}
-
-func debugPrint(pkg *packages.Package, node ast.Node, message string, args ...any) {
-	msg := makeErrorMsgf(pkg, node, message, args...)
-	fmt.Print(msg)
 }
 
 func makeErrorMsgf(pkg *packages.Package, node ast.Node, message string, args ...any) string {
@@ -296,7 +290,6 @@ func (g *Parser) filterPackageDecls(pkg *packages.Package) error {
 			}
 		}
 		stxFile.Decls = stxFile.Decls[:j]
-		// debugPrint(pkg, stxFile, "num decls: %d", len(stxFile.Decls))
 
 		shouldKeep := len(stxFile.Decls) > 0
 		if !shouldKeep {
