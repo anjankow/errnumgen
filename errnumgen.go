@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/anjankow/errnumgen/pkg/errparser"
 	"github.com/anjankow/errnumgen/pkg/generator"
-	"github.com/anjankow/errnumgen/pkg/parser"
 )
 
 var (
@@ -63,7 +63,7 @@ func run(dir string) error {
 		return err
 	}
 
-	popts := parser.GetDefaultOptions()
+	popts := errparser.GetDefaultOptions()
 	// Use the generator's callback to process the error params
 	popts.RetParamParser = g.ParseRetParam
 	popts.SkipPaths = []string{gopts.OutPath}
@@ -73,7 +73,7 @@ func run(dir string) error {
 		}
 	}
 	// Initialize the parser
-	p, err := parser.New(dir, popts)
+	p, err := errparser.New(dir, popts)
 	if err != nil {
 		return err
 	}
