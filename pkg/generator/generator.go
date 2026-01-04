@@ -49,10 +49,17 @@ func New(opts GenOptions) (Generator, error) {
 	// Get the absolute paths
 	outPathAbs, err := filepath.Abs(opts.OutPath)
 	if err != nil {
-		return Generator{}, fmt.Errorf("invalid output path %s, can't create an absolute path: %w", opts.OutPath, err)
+		return Generator{}, fmt.Errorf("invalid output path %q, can't create an absolute path: %w", opts.OutPath, err)
 	}
-	if outPathAbs == "." {
-		return Generator{}, fmt.Errorf("invalid output file path %s", opts.OutPath)
+
+	// Output path should be a golang's file name. Add it if missing
+	if filepath.Ext(outPathAbs) != ".go" {
+		outPathAbs += ".go"
+	}
+
+	// Make sure that the path is given together with a directory
+	if filepath.Dir(outPathAbs) == "." {
+		return Generator{}, fmt.Errorf("invalid output path %q, expected an absolute or a relative path, not just a filename", opts.OutPath)
 	}
 
 	return Generator{
